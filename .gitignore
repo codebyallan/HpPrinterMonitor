@@ -1,0 +1,9 @@
+[Bb]in/
+[Oo]bj/
+*.nupkg
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
+*.log
