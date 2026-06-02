@@ -15,12 +15,6 @@ public class PrinterSnmpClient
     private readonly string _community;
     private readonly int _timeoutMs;
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="PrinterSnmpClient"/> class.
-    /// </summary>
-    /// <param name="ipAddress">The IP address of the target printer.</param>
-    /// <param name="community">The SNMP community string (defaults to "public").</param>
-    /// <param name="timeoutMs">Timeout in milliseconds for SNMP requests (defaults to 3000ms).</param>
     public PrinterSnmpClient(string ipAddress, string community = "public", int timeoutMs = 3000)
     {
         _ipAddress = ipAddress;
@@ -29,64 +23,56 @@ public class PrinterSnmpClient
     }
 
     /// <summary>
-    /// Retrieves printer data including total page count and supply levels.
+    /// Retrieves comprehensive printer telemetry including total page counts, 
+    /// color/mono breakdowns, and current supply levels using SNMP.
     /// </summary>
-    /// <returns>A <see cref="Printer"/> object containing the retrieved telemetry.</returns>
     public async Task<Printer> GetPrinterDataAsync()
     {
-        var endpoint = new IPEndPoint(IPAddress.Parse(_ipAddress), 161);
+        var endpoint     = new IPEndPoint(IPAddress.Parse(_ipAddress), 161);
         var communityStr = new OctetString(_community);
 
-        // 1. Retrieve Total Page Count
+        // 1. Retrieve total engine cycles using standard Printer-MIB (RFC 3805)
         string? totalPagesStr = await GetSingleOidAsync(endpoint, communityStr, HpPrinterOids.TotalPages);
         int totalPages = TryParseInt(totalPagesStr);
 
-        var supplies = new List<Supply>();
+        // 2. Retrieve color and mono page breakdowns using HP proprietary OIDs
+        // Validated on HP Color LaserJet Flow models (e.g., E57540, E78635)
+        string? colorStr = await GetSingleOidAsync(endpoint, communityStr, HpPrinterOids.TotalColorPages);
+        string? monoStr  = await GetSingleOidAsync(endpoint, communityStr, HpPrinterOids.TotalMonoPages);
 
-        // 2. Loop to retrieve supplies dynamically.
-        // We iterate up to MaxSupplies, but stop if a supply name is not found.
+        int? colorPages = colorStr is not null && int.TryParse(colorStr, out int c) && c >= 0 ? c : null;
+        int? monoPages  = monoStr  is not null && int.TryParse(monoStr,  out int m) && m >= 0 ? m : null;
+
+        // 3. Iterate through possible supply slots to retrieve names and current levels
+        var supplies = new List<Supply>();
         for (int i = 1; i <= HpPrinterOids.MaxSupplies; i++)
         {
             try
             {
-                string? colorName = await GetSingleOidAsync(endpoint, communityStr, HpPrinterOids.GetSupplyNameOid(i));
+                string? name = await GetSingleOidAsync(endpoint, communityStr, HpPrinterOids.GetSupplyNameOid(i));
+                if (string.IsNullOrEmpty(name)) break;
 
-                // If no color name is returned, we assume there are no more supplies.
-                if (string.IsNullOrEmpty(colorName)) break;
+                string? levelStr = await GetSingleOidAsync(endpoint, communityStr, HpPrinterOids.GetSupplyLevelOid(i));
+                int level = Math.Max(0, TryParseInt(levelStr));
 
-                string? currentStr = await GetSingleOidAsync(endpoint, communityStr, HpPrinterOids.GetSupplyLevelOid(i));
-                int currentLevel = TryParseInt(currentStr);
-
-                // Ensure level is not negative.
-                if (currentLevel < 0) currentLevel = 0;
-
-                supplies.Add(new Supply(colorName.Trim('\0', ' '), currentLevel));
+                supplies.Add(new Supply(name.Trim('\0', ' '), level));
             }
-            catch (Exception)
-            {
-                // Stop processing supplies if an unexpected error occurs.
-                break;
-            }
+            catch { break; }
         }
 
-        // 3. Construct the final Model
-        return new Printer(_ipAddress, DateTime.Now, totalPages, supplies);
+        return new Printer(_ipAddress, DateTime.UtcNow, totalPages, supplies, colorPages, monoPages);
     }
 
     /// <summary>
-    /// Performs a single SNMP GET request for a specific OID.
+    /// Performs a single SNMP GET request for the specified OID.
     /// </summary>
-    /// <param name="endpoint">The target endpoint.</param>
-    /// <param name="community">The community string.</param>
-    /// <param name="oid">The OID to query.</param>
-    /// <returns>The value as a string, or null if not found or an error occurred.</returns>
+    /// <returns>The value of the OID as a string, or null if the object is not found, 
+    /// the request times out, or an SNMP error occurs.</returns>
     private async Task<string?> GetSingleOidAsync(IPEndPoint endpoint, OctetString community, string oid)
     {
         try
         {
             var variables = new List<Variable> { new Variable(new ObjectIdentifier(oid)) };
-
-            // Use CancellationToken to handle timeout properly.
             using var cts = new CancellationTokenSource(_timeoutMs);
 
             var result = await Messenger.GetAsync(VersionCode.V2, endpoint, community, variables, cts.Token);
@@ -101,22 +87,10 @@ public class PrinterSnmpClient
         }
         catch (Exception ex) when (ex is SnmpException || ex is OperationCanceledException)
         {
-            // Log or handle SNMP failure or timeout silently to avoid breaking the whole collection.
             return null;
         }
     }
 
-    /// <summary>
-    /// Safely parses a string to an integer.
-    /// </summary>
-    /// <param name="value">The string to parse.</param>
-    /// <returns>The parsed integer, or 0 if parsing fails or value is null.</returns>
-    private int TryParseInt(string? value)
-    {
-        if (int.TryParse(value, out int result))
-        {
-            return result;
-        }
-        return 0;
-    }
+    private static int TryParseInt(string? value)
+        => int.TryParse(value, out int result) ? result : 0;
 }
